@@ -21,6 +21,18 @@ export abstract class QueryAble implements IQueryAble {
 
     public static connectionErrorListener = () => { }
 
+    /**
+     * Get notified about a query error without replacing pg-cursor's own error handler:
+     * that one sends the Sync message, without it the connection never gets ReadyForQuery and hangs.
+     */
+    private static chainCursorErrorHandler(query: QueryStream, onError: (err: Error) => void) {
+        let originalHandleError = query.handleError;
+        query.handleError = (err: Error, connection: any) => {
+            originalHandleError.call(query, err, connection);
+            onError(err);
+        };
+    }
+
     setLogger(logger: PgDbLogger) {
         this.logger = logger;
     }
@@ -88,17 +100,9 @@ export abstract class QueryAble implements IQueryAble {
             return options?.rowMode ? { columns: (res.fields || []).map(f => f.name), rows: res.rows || [] } : res.rows;
         } catch (e) {
             pgUtils.logError(logger, { error: <Error>e, sql, params, connection });
-            if (connection) {
-                try {
-                    //If any problem has happened in a dedicated connection, (wrong sql format or non-accessible postgres server)
-                    //close the connection to be a free connection in the pool,
-                    //but keep the db.connection member non - null to crash in all of the following commands
-                    connection.off('error', QueryAble.connectionErrorListener);
-                    connection.release();
-                } catch (e) {
-                    logger.error('connection error', (<Error>e).message);
-                }
-            }
+            // A connection borrowed by this call is already released in the `finally` above.
+            // A dedicated connection (transaction / dedicatedConnectionBegin) is owned by the PgDb instance:
+            // it must stay checked out, the owner ends it with transactionRollback() / dedicatedConnectionEnd().
             throw e;
         }
     }
@@ -121,6 +125,8 @@ export abstract class QueryAble implements IQueryAble {
             await this.db.runRestartConnectionForListen();
         }
         let connection = this.db.connection!;
+        // only a connection borrowed from the pool by this call may be released here
+        let isOwnConnection = !connection;
         let logger = this.getLogger(true);
         let positionedParams: any[] | undefined;
 
@@ -141,7 +147,7 @@ export abstract class QueryAble implements IQueryAble {
                 let query = new QueryStream(sql, positionedParams);
                 let stream = connection.query(query);
                 await new Promise((resolve, reject) => {
-                    query.handleError = reject;
+                    QueryAble.chainCursorErrorHandler(query, reject);
                     stream.on('data', (res: any) => {
                         try {
                             let fields = stream._result && stream._result.fields || stream.cursor._result && stream.cursor._result.fields;
@@ -171,7 +177,7 @@ export abstract class QueryAble implements IQueryAble {
                     query = new QueryStream(sql, positionedParams);
                     stream = connection.query(query);
                     await new Promise((resolve, reject) => {
-                        query.handleError = reject;
+                        QueryAble.chainCursorErrorHandler(query, reject);
                         stream.on('data', (res: any) => {
                             try {
                                 let fields = stream._result && stream._result.fields || stream.cursor._result && stream.cursor._result.fields;
@@ -201,11 +207,13 @@ export abstract class QueryAble implements IQueryAble {
 
                 connection.off('error', QueryAble.connectionErrorListener);
                 connection.release();
+                connection = null!;
             }
         } catch (e) {
             pgUtils.logError(logger, { error: <Error>e, sql, params, connection });
-            if (connection) {
+            if (connection && isOwnConnection) {
                 try {
+                    connection.off('error', QueryAble.connectionErrorListener);
                     connection.release();
                 } catch (e) {
                     logger.error('connection error', (<Error>e).message);
@@ -220,6 +228,8 @@ export abstract class QueryAble implements IQueryAble {
             await this.db.runRestartConnectionForListen();
         }
         let connection = this.db.connection;
+        // only a connection borrowed from the pool by this call may be released here
+        let isOwnConnection = !connection;
         let logger = (options && options.logger || this.getLogger(false));
         let pgStream: QueryStream;
         let queryable = this;
@@ -244,16 +254,32 @@ export abstract class QueryAble implements IQueryAble {
                 cb();
             },
         });
-        convertTypeFilter.on('error', (e: Error) => {
-            if (connection) {
-                try {
-                    connection.release();
-                } catch (e) {
-                    logger.error('connection error', (<Error>e).message);
-                }
+        let hasSqlError = false;
+        let hasFailed = false;
+        let fail = (err: Error) => {
+            if (!hasFailed) {
+                hasFailed = true;
+                convertTypeFilter.emit('error', err);
             }
-            connection = null;
+        };
+        convertTypeFilter.on('error', (e: Error) => {
+            hasFailed = true;
             pgUtils.logError(logger, { error: e, sql, params, connection });
+            if (isOwnConnection) {
+                if (connection) {
+                    try {
+                        connection.off('error', QueryAble.connectionErrorListener);
+                        connection.release();
+                    } catch (e) {
+                        logger.error('connection error', (<Error>e).message);
+                    }
+                }
+                connection = null;
+            } else if (!hasSqlError && pgStream && !pgStream.destroyed) {
+                // Dedicated connection stays with its owner, but close the still open cursor (e.g. on a conversion error)
+                // so the connection is usable again. After an SQL error the cursor has already sent Sync, nothing to close.
+                pgStream.destroy();
+            }
         });
 
         let positionedParams: any[] | undefined;
@@ -270,10 +296,12 @@ export abstract class QueryAble implements IQueryAble {
             if (connection) {
                 logger.log(sql, util.inspect(positionedParams, false, null), connection.processID);
                 let query = new QueryStream(sql, positionedParams);
-                query.handleError = (err: Error) => {
-                    convertTypeFilter.emit('error', err);
-                };
+                QueryAble.chainCursorErrorHandler(query, (err: Error) => {
+                    hasSqlError = true;
+                    fail(err);
+                });
                 pgStream = connection.query(query);
+                pgStream.on('error', fail);
                 return pgStream.pipe(convertTypeFilter);
             } else {
                 connection = await this.db.pool.connect();
@@ -281,9 +309,10 @@ export abstract class QueryAble implements IQueryAble {
                 connection.on('error', QueryAble.connectionErrorListener);
 
                 let query = new QueryStream(sql, positionedParams);
-                query.handleError = (err: Error, _connection: pg.PoolClient) => {
-                    convertTypeFilter.emit('error', err);
-                };
+                QueryAble.chainCursorErrorHandler(query, (err: Error) => {
+                    hasSqlError = true;
+                    fail(err);
+                });
                 pgStream = connection.query(query);
                 pgStream.on('close', () => {
                     if (connection) {

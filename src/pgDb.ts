@@ -456,15 +456,19 @@ export class PgDb extends QueryAble /*implements IPgDb*/ {
         return pgDb;
     }
 
-    async dedicatedConnectionEnd(): Promise<PgDb> {
+    /**
+     * @param destroyWithError if given, the connection is not reused, but closed (e.g. its state is unknown after an error)
+     */
+    async dedicatedConnectionEnd(destroyWithError?: Error): Promise<PgDb> {
         if (this.connection) {
-            this.connection.off('error', QueryAble.connectionErrorListener);
-            try {
-                await this.connection.release();
-            } catch (err) {
-                this.getLogger().error('Error while dedicated connection end.', err);
-            }
+            let connection = this.connection;
             this.connection = null;
+            connection.off('error', QueryAble.connectionErrorListener);
+            try {
+                connection.release(destroyWithError);
+            } catch (err) {
+                this.getLogger(true).error('Error while dedicated connection end.', (connection as any).processID, err);
+            }
         }
         return this;
     }
@@ -515,7 +519,14 @@ export class PgDb extends QueryAble /*implements IPgDb*/ {
     }
 
     async transactionCommit(): Promise<PgDb> {
-        await this.query('COMMIT');
+        try {
+            await this.query('COMMIT');
+        } catch (e) {
+            // a failed COMMIT (e.g. deferred constraint) ends the transaction on the server side as well,
+            // anything else (e.g. connection error) leaves the connection in an unknown state -> destroy it
+            await this.dedicatedConnectionEnd(e instanceof pg.DatabaseError ? undefined : <Error>e);
+            throw e;
+        }
         return this.dedicatedConnectionEnd();
     }
 
@@ -525,7 +536,13 @@ export class PgDb extends QueryAble /*implements IPgDb*/ {
             await this.query(`ROLLBACK TO SAVEPOINT "${name}"`);
             return this;
         } else {
-            await this.query('ROLLBACK');
+            try {
+                await this.query('ROLLBACK');
+            } catch (e) {
+                // connection state is unknown (e.g. broken socket), do not give it back to the pool for reuse
+                await this.dedicatedConnectionEnd(<Error>e);
+                throw e;
+            }
             return this.dedicatedConnectionEnd();
         }
     }

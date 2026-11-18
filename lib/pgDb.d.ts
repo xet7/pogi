@@ -49,7 +49,7 @@ export declare class PgDb extends QueryAble {
     setPgDbTypeParser(typeName: string, parser: (s: string) => any, schemaName?: string): Promise<void>;
     resetMissingParsers(connection: pg.PoolClient, oidList: number[]): Promise<void>;
     dedicatedConnectionBegin(): Promise<PgDb>;
-    dedicatedConnectionEnd(): Promise<PgDb>;
+    dedicatedConnectionEnd(destroyWithError?: Error): Promise<PgDb>;
     savePoint(name: string): Promise<PgDb>;
     savePointRelease(name: string): Promise<PgDb>;
     transactionBegin(options?: {

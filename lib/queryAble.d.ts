@@ -8,6 +8,7 @@ export declare abstract class QueryAble implements IQueryAble {
     schema: PgSchema;
     logger: PgDbLogger;
     static connectionErrorListener: () => void;
+    private static chainCursorErrorHandler;
     setLogger(logger: PgDbLogger): void;
     getLogger(useConsoleAsDefault?: boolean): PgDbLogger;
     run(sql: string, params?: any[] | {}, options?: SqlQueryOptions): Promise<any[]>;
